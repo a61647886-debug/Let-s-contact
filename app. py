@@ -1,0 +1,1436 @@
+from flask import (
+    Flask,
+    request,
+    redirect,
+    session,
+    render_template_string,
+    send_from_directory
+)
+
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+import sqlite3
+import os
+import uuid
+
+
+app = Flask(__name__)
+
+app.secret_key = "lets-contact-local-secret"
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+UPLOAD_DIR = os.path.join(BASE, "uploads")
+DB = os.path.join(BASE, "lets_contact.db")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+ALLOWED = {
+    "jpg",
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "mp4",
+    "webm"
+}
+
+
+# =========================================================
+# DATABASE (Safe Migration)
+# =========================================================
+
+def get_db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+
+    con = get_db()
+
+    # USERS
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            is_suspended INTEGER DEFAULT 0,
+            bkash_number TEXT
+        )
+    """)
+
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN is_suspended INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        con.execute("ALTER TABLE users ADD COLUMN bkash_number TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Default Admin account creation
+    admin_hash = generate_password_hash("secret123")
+    con.execute("""
+        INSERT OR IGNORE INTO users (username, password)
+        VALUES ('admin', ?)
+    """, (admin_hash,))
+
+    # POSTS
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT,
+            filename TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            media_type TEXT NOT NULL
+        )
+    """)
+
+    try:
+        con.execute("ALTER TABLE posts ADD COLUMN title TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # REACTIONS
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            reaction TEXT NOT NULL,
+            UNIQUE(user_id, post_id)
+        )
+    """)
+
+    # COMMENTS (with parent_id for replies)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            comment TEXT NOT NULL,
+            parent_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    try:
+        con.execute("ALTER TABLE comments ADD COLUMN parent_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+    # REPORTS
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            post_id INTEGER NOT NULL,
+            UNIQUE(user_id, post_id)
+        )
+    """)
+
+    # FOLLOWS
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS follows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            follower_id INTEGER NOT NULL,
+            following_id INTEGER NOT NULL,
+            UNIQUE(follower_id, following_id)
+        )
+    """)
+
+    # MESSAGES
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            receiver_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+
+# =========================================================
+# CSS
+# =========================================================
+
+STYLE = """
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0d1117;
+    color: #f0f6fc;
+    font-family: Arial, sans-serif;
+}
+
+nav {
+    background: #161b22;
+    padding: 16px 6%;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #30363d;
+}
+
+.logo {
+    font-size: 21px;
+    font-weight: bold;
+}
+
+nav a {
+    color: white;
+    text-decoration: none;
+    margin-left: 15px;
+}
+
+.container {
+    max-width: 850px;
+    margin: auto;
+    padding: 25px 15px;
+}
+
+.card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 18px;
+    padding: 22px;
+    margin-bottom: 20px;
+}
+
+input,
+textarea {
+    width: 100%;
+    padding: 13px;
+    margin: 8px 0;
+    background: #0d1117;
+    color: white;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    font-family: Arial, sans-serif;
+}
+
+textarea {
+    min-height: 80px;
+    resize: vertical;
+}
+
+button {
+    padding: 11px 18px;
+    border: 0;
+    border-radius: 10px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.primary {
+    background: #238636;
+    color: white;
+}
+
+.like-button {
+    background: #1f6feb;
+    color: white;
+}
+
+.dislike-button {
+    background: #da3633;
+    color: white;
+}
+
+.report-button {
+    background: #8957e5;
+    color: white;
+}
+
+.neutral-button {
+    background: #30363d;
+    color: white;
+}
+
+img,
+video {
+    width: 100%;
+    max-height: 550px;
+    object-fit: cover;
+    border-radius: 14px;
+    margin-top: 12px;
+}
+
+.user {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.post-title {
+    font-size: 20px;
+    font-weight: bold;
+    color: #f0f6fc;
+    margin: 10px 0 5px 0;
+}
+
+.error {
+    color: #ff7b72;
+}
+
+.success {
+    color: #3fb950;
+}
+
+.small {
+    color: #8b949e;
+}
+
+.reactions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: 15px;
+    flex-wrap: wrap;
+}
+
+.reactions form {
+    margin: 0;
+}
+
+.count {
+    color: #8b949e;
+    font-size: 14px;
+}
+
+.comments {
+    margin-top: 20px;
+    border-top: 1px solid #30363d;
+    padding-top: 15px;
+}
+
+.comment {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 12px;
+    margin-top: 10px;
+}
+
+.reply-comment {
+    margin-left: 20px;
+    margin-top: 8px;
+    border-left: 2px solid #30363d;
+    padding-left: 10px;
+    background: #161b22;
+}
+
+.comment-user {
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.comment-text {
+    color: #e6edf3;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.search-box {
+    display: flex;
+    gap: 10px;
+}
+
+.search-box input {
+    flex: 1;
+    margin: 0;
+}
+
+.search-box button {
+    white-space: nowrap;
+}
+
+.user-result {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 15px;
+    margin-top: 10px;
+    gap: 10px;
+}
+
+.user-result a {
+    color: white;
+    text-decoration: none;
+}
+
+.chat-box {
+    height: 500px;
+    overflow-y: auto;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 15px;
+    padding: 15px;
+    margin-bottom: 15px;
+}
+
+.message {
+    display: flex;
+    margin: 10px 0;
+}
+
+.message.mine {
+    justify-content: flex-end;
+}
+
+.message-bubble {
+    max-width: 75%;
+    padding: 10px 14px;
+    border-radius: 15px;
+    background: #30363d;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.message.mine .message-bubble {
+    background: #238636;
+}
+
+.message-time {
+    font-size: 11px;
+    color: #8b949e;
+    margin-top: 5px;
+}
+
+.chat-form {
+    display: flex;
+    gap: 10px;
+}
+
+.chat-form textarea {
+    flex: 1;
+    margin: 0;
+    min-height: 50px;
+}
+
+.chat-form button {
+    height: 50px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+
+th, td {
+    border: 1px solid #30363d;
+    padding: 12px;
+    text-align: left;
+}
+
+th {
+    background: #161b22;
+}
+
+@media (max-width: 600px) {
+    nav {
+        padding: 14px;
+    }
+    nav a {
+        margin-left: 7px;
+        font-size: 13px;
+    }
+    .card {
+        padding: 16px;
+    }
+    .search-box {
+        flex-direction: column;
+    }
+}
+
+</style>
+"""
+
+
+# =========================================================
+# PAGE LAYOUT
+# =========================================================
+
+def page(content):
+
+    nav = """
+    <nav>
+        <div class="logo">
+            🌐 Let's Contact
+        </div>
+        <div>
+            <a href="/">Home</a>
+    """
+
+    if session.get("user") == "admin":
+        nav += """
+            <a href="/admin">🛡️ Admin Panel</a>
+            <a href="/logout">Logout</a>
+        """
+    elif session.get("user"):
+        nav += """
+            <a href="/search">🔎 Search</a>
+            <a href="/upload">Upload</a>
+            <a href="/bkash">💰 Monetization</a>
+            <a href="/profile">👤 Profile</a>
+            <a href="/logout">Logout</a>
+        """
+    else:
+        nav += """
+            <a href="/login">Login</a>
+            <a href="/register">Register</a>
+        """
+
+    nav += """
+        </div>
+    </nav>
+    """
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Let's Contact</title>
+        {STYLE}
+    </head>
+    <body>
+        {nav}
+        <main class="container">
+            {content}
+        </main>
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+@app.route("/")
+def home():
+
+    if session.get("user") == "admin":
+        return redirect("/admin")
+
+    query = request.args.get("q", "").strip()
+
+    con = get_db()
+
+    if query:
+        posts = con.execute("""
+            SELECT posts.*, users.username
+            FROM posts
+            JOIN users ON posts.user_id = users.id
+            WHERE posts.title LIKE ?
+            ORDER BY posts.id DESC
+        """, ('%' + query + '%',)).fetchall()
+    else:
+        posts = con.execute("""
+            SELECT posts.*, users.username
+            FROM posts
+            JOIN users ON posts.user_id = users.id
+            ORDER BY posts.id DESC
+        """).fetchall()
+
+    comments = con.execute("""
+        SELECT comments.*, users.username
+        FROM comments
+        JOIN users ON comments.user_id = users.id
+        ORDER BY comments.id ASC
+    """).fetchall()
+
+    reaction_counts = con.execute("""
+        SELECT
+            post_id,
+            SUM(CASE WHEN reaction = 'like' THEN 1 ELSE 0 END) AS likes,
+            SUM(CASE WHEN reaction = 'dislike' THEN 1 ELSE 0 END) AS dislikes
+        FROM reactions
+        GROUP BY post_id
+    """).fetchall()
+
+    user_reactions = {}
+    user_reports = {}
+    following_ids = set()
+    current_user_id = None
+
+    if session.get("user"):
+        current_user = con.execute("""
+            SELECT id FROM users WHERE username = ?
+        """, (session["user"],)).fetchone()
+
+        if current_user:
+            current_user_id = current_user["id"]
+            rows = con.execute("""
+                SELECT post_id, reaction FROM reactions WHERE user_id = ?
+            """, (current_user_id,)).fetchall()
+
+            for row in rows:
+                user_reactions[row["post_id"]] = row["reaction"]
+
+            report_rows = con.execute("""
+                SELECT post_id FROM reports WHERE user_id = ?
+            """, (current_user_id,)).fetchall()
+
+            for r in report_rows:
+                user_reports[r["post_id"]] = True
+
+            f_rows = con.execute("""
+                SELECT following_id FROM follows WHERE follower_id = ?
+            """, (current_user_id,)).fetchall()
+            for r in f_rows:
+                following_ids.add(r["following_id"])
+
+    con.close()
+
+    counts = {}
+    for row in reaction_counts:
+        counts[row["post_id"]] = {
+            "likes": row["likes"] or 0,
+            "dislikes": row["dislikes"] or 0
+        }
+
+    comment_dict = {}
+    reply_dict = {}
+    for comment in comments:
+        post_id = comment["post_id"]
+        parent_id = comment["parent_id"]
+        if parent_id is None:
+            if post_id not in comment_dict:
+                comment_dict[post_id] = []
+            comment_dict[post_id].append(comment)
+        else:
+            if parent_id not in reply_dict:
+                reply_dict[parent_id] = []
+            reply_dict[parent_id].append(comment)
+
+    feed = ""
+    for post in posts:
+        post_id = post["id"]
+        author_id = post["user_id"]
+
+        if post["media_type"] == "image":
+            media = f'<img src="/uploads/{post["filename"]}" alt="Media">'
+        else:
+            media = f'<video controls><source src="/uploads/{post["filename"]}">Your browser does not support video.</video>'
+
+        likes = counts.get(post_id, {}).get("likes", 0)
+        dislikes = counts.get(post_id, {}).get("dislikes", 0)
+        current_reaction = user_reactions.get(post_id)
+        post_title = post['title'] if post['title'] else ""
+
+        follow_button_html = ""
+        if session.get("user") and current_user_id and author_id != current_user_id:
+            is_following = author_id in following_ids
+            follow_text = "Unfollow" if is_following else "Follow"
+            follow_class = "dislike-button" if is_following else "primary"
+            follow_button_html = f"""
+            <form method="POST" action="/follow/{author_id}">
+                <button class="{follow_class}">{follow_text}</button>
+            </form>
+            """
+
+        if session.get("user"):
+            like_text = "👍 Unlike" if current_reaction == "like" else "👍 Like"
+            dislike_text = "👎 Remove Dislike" if current_reaction == "dislike" else "👎 Dislike"
+            report_text = "🚩 Reported" if user_reports.get(post_id) else "🚩 Report"
+
+            reactions_html = f"""
+            <div class="reactions">
+                <form method="POST" action="/react/{post_id}">
+                    <input type="hidden" name="reaction" value="like">
+                    <button class="like-button">{like_text}</button>
+                </form>
+                {follow_button_html}
+                <form method="POST" action="/react/{post_id}">
+                    <input type="hidden" name="reaction" value="dislike">
+                    <button class="dislike-button">{dislike_text}</button>
+                </form>
+                <form method="POST" action="/report/{post_id}">
+                    <button class="report-button">{report_text}</button>
+                </form>
+                <a href="/download/{post_id}"><button class="neutral-button">📥 Download</button></a>
+                <span class="count">👍 {likes}</span>
+                <span class="count">👎 {dislikes}</span>
+            </div>
+            """
+        else:
+            reactions_html = f"""
+            <div class="reactions">
+                <a href="/download/{post_id}"><button class="neutral-button">📥 Download</button></a>
+                <span class="count">👍 {likes}</span>
+                <span class="count">👎 {dislikes}</span>
+                <a href="/login"><button class="neutral-button">🔐 Login to react</button></a>
+            </div>
+            """
+
+        post_comments = comment_dict.get(post_id, [])
+        comments_html = ""
+        for comment in post_comments:
+            c_id = comment["id"]
+            replies = reply_dict.get(c_id, [])
+            replies_html = ""
+            for rep in replies:
+                replies_html += f"""
+                <div class="comment reply-comment">
+                    <div class="comment-user">👤 {rep['username']}</div>
+                    <div class="comment-text">{rep['comment']}</div>
+                </div>
+                """
+
+            reply_form = ""
+            if session.get("user"):
+                reply_form = f"""
+                <form method="POST" action="/comment/{post_id}" style="margin-top: 8px;">
+                    <input type="hidden" name="parent_id" value="{c_id}">
+                    <input type="text" name="comment" placeholder="Write a reply..." maxlength="500" required style="padding: 8px; margin: 4px 0; font-size: 13px;">
+                    <button class="primary" style="padding: 6px 12px; font-size: 12px;">Reply</button>
+                </form>
+                """
+
+            comments_html += f"""
+            <div class="comment">
+                <div class="comment-user">👤 {comment['username']}</div>
+                <div class="comment-text">{comment['comment']}</div>
+                {reply_form}
+                {replies_html}
+            </div>
+            """
+
+        if session.get("user"):
+            comment_form = f"""
+            <form method="POST" action="/comment/{post_id}">
+                <textarea name="comment" placeholder="Write a comment..." maxlength="1000" required></textarea>
+                <button class="primary">💬 Comment</button>
+            </form>
+            """
+        else:
+            comment_form = '<p class="small"><a href="/login">Login</a> to write a comment.</p>'
+
+        feed += f"""
+        <div class="card">
+            <div class="user">👤 {post['username']}</div>
+            <div class="post-title">{post_title}</div>
+            {media}
+            <p class="small">Original file: {post['original_name']}</p>
+            {reactions_html}
+            <div class="comments">
+                <h3>💬 Comments</h3>
+                {comment_form}
+                {comments_html}
+            </div>
+        </div>
+        """
+
+    if not feed:
+        feed = '<div class="card"><h2>📭 No posts found</h2><p>Try searching with a different title or be the first to upload!</p></div>'
+
+    if session.get("user"):
+        button = '<a href="/upload"><button class="primary">📤 Upload Photo / Video</button></a>'
+    else:
+        button = '<a href="/register"><button class="primary">🚀 Create Account</button></a>'
+
+    return page(f"""
+        <div class="card">
+            <h1>Welcome to Let's Contact 👋</h1>
+            <p>Share photos and videos with the community.</p>
+            {button}
+        </div>
+        <div class="card">
+            <form method="GET" action="/">
+                <div class="search-box">
+                    <input name="q" value="{query}" placeholder="Search posts by title...">
+                    <button class="primary">🔍 Search Posts</button>
+                </div>
+            </form>
+        </div>
+        <h2>🌎 Community Feed {f'for "{query}"' if query else ''}</h2>
+        {feed}
+    """)
+
+
+# =========================================================
+# REGISTER
+# =========================================================
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    error = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if username.lower() == "admin":
+            error = "This username is reserved."
+        elif len(username) < 3:
+            error = "Username must be at least 3 characters."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters."
+        else:
+            try:
+                con = get_db()
+                con.execute("""
+                    INSERT INTO users(username, password)
+                    VALUES (?, ?)
+                """, (username, generate_password_hash(password)))
+                con.commit()
+                con.close()
+                session["user"] = username
+                return redirect("/")
+            except sqlite3.IntegrityError:
+                error = "Username already exists."
+
+    return page(f"""
+        <div class="card">
+            <h2>✨ Create Account</h2>
+            <p class="error">{error}</p>
+            <form method="POST">
+                <input name="username" placeholder="Username" required>
+                <input name="password" type="password" placeholder="Password" required>
+                <button class="primary">Register</button>
+            </form>
+            <p>Already have an account? <a href="/login">Login</a></p>
+        </div>
+    """)
+
+
+# =========================================================
+# LOGIN
+# =========================================================
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = ""
+    if request.method == "POST":
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        con = get_db()
+        user = con.execute("""
+            SELECT * FROM users WHERE username = ?
+        """, (username,)).fetchone()
+        con.close()
+
+        if user and check_password_hash(user["password"], password):
+            if user["is_suspended"] == 1:
+                error = "Apnar account-ti suspend kora hoyeche."
+            else:
+                session["user"] = username
+                if username == "admin":
+                    return redirect("/admin")
+                return redirect("/")
+        else:
+            error = "Invalid username or password."
+
+    return page(f"""
+        <div class="card">
+            <h2>🔐 Login</h2>
+            <p class="error">{error}</p>
+            <form method="POST">
+                <input name="username" placeholder="Username" required>
+                <input name="password" type="password" placeholder="Password" required>
+                <button class="primary">Login</button>
+            </form>
+            <p>New here? <a href="/register">Create account</a></p>
+        </div>
+    """)
+
+
+# =========================================================
+# ADMIN PANEL (Updated with followers & total likes)
+# =========================================================
+
+@app.route("/admin")
+def admin_panel():
+    if session.get("user") != "admin":
+        return redirect("/login")
+
+    con = get_db()
+    users = con.execute("""
+        SELECT u.id, u.username, u.bkash_number, u.is_suspended,
+               (SELECT COUNT(*) FROM follows WHERE following_id = u.id) AS followers_count,
+               (SELECT SUM(CASE WHEN reactions.reaction = 'like' THEN 1 ELSE 0 END) 
+                FROM posts 
+                LEFT JOIN reactions ON posts.id = reactions.post_id 
+                WHERE posts.user_id = u.id) AS total_likes
+        FROM users u
+        WHERE u.username != 'admin'
+        ORDER BY u.id DESC
+    """).fetchall()
+    con.close()
+
+    rows_html = ""
+    for u in users:
+        bkash = u["bkash_number"] if u["bkash_number"] else "Not provided"
+        status = "Suspended" if u["is_suspended"] == 1 else "Active"
+        likes = u["total_likes"] if u["total_likes"] else 0
+        followers = u["followers_count"] if u["followers_count"] else 0
+        rows_html += f"""
+        <tr>
+            <td>{u['username']}</td>
+            <td>{bkash}</td>
+            <td>👍 {likes}</td>
+            <td>👥 {followers}</td>
+            <td>{status}</td>
+        </tr>
+        """
+
+    if not rows_html:
+        rows_html = '<tr><td colspan="5">No users found.</td></tr>'
+
+    return page(f"""
+        <div class="card">
+            <h2>🛡️ Admin Dashboard - Monetization & User Stats</h2>
+            <p class="small">Here you can view user bKash numbers, total likes, followers count, and status.</p>
+            <table>
+                <tr>
+                    <th>Username</th>
+                    <th>bKash Number</th>
+                    <th>Total Likes</th>
+                    <th>Followers</th>
+                    <th>Status</th>
+                </tr>
+                {rows_html}
+            </table>
+        </div>
+    """)
+
+
+# =========================================================
+# MONETIZATION (bKash setup for users)
+# =========================================================
+
+@app.route("/bkash", methods=["GET", "POST"])
+def bkash_setup():
+    if "user" not in session or session["user"] == "admin":
+        return redirect("/login")
+
+    con = get_db()
+    message = ""
+
+    if request.method == "POST":
+        bkash = request.form.get("bkash", "").strip()
+        con.execute("""
+            UPDATE users
+            SET bkash_number = ?
+            WHERE username = ?
+        """, (bkash, session["user"]))
+        con.commit()
+        message = "bKash number successfully updated!"
+
+    user = con.execute("""
+        SELECT bkash_number FROM users WHERE username = ?
+    """, (session["user"],)).fetchone()
+    con.close()
+
+    current_bkash = user["bkash_number"] if user and user["bkash_number"] else ""
+
+    return page(f"""
+        <div class="card">
+            <h2>💰 Monetization - bKash Number Setup</h2>
+            <p class="success">{message}</p>
+            <p class="small">Enter your personal bKash number so the admin can send your earnings manually.</p>
+            <form method="POST">
+                <input type="text" name="bkash" value="{current_bkash}" placeholder="e.g., 017XXXXXXXX" required>
+                <button class="primary">Save bKash Number</button>
+            </form>
+        </div>
+    """)
+
+
+# =========================================================
+# USER PROFILE & STATS
+# =========================================================
+
+@app.route("/profile")
+def profile():
+    if "user" not in session or session["user"] == "admin":
+        return redirect("/login")
+
+    con = get_db()
+    current_user = con.execute("SELECT * FROM users WHERE username = ?", (session["user"],)).fetchone()
+    if not current_user:
+        con.close()
+        return redirect("/logout")
+
+    user_id = current_user["id"]
+
+    posts = con.execute("""
+        SELECT posts.*, 
+        (SELECT COUNT(*) FROM reactions WHERE reactions.post_id = posts.id AND reaction='like') as likes,
+        (SELECT COUNT(*) FROM reactions WHERE reactions.post_id = posts.id AND reaction='dislike') as dislikes
+        FROM posts WHERE user_id = ? ORDER BY id DESC
+    """, (user_id,)).fetchall()
+
+    totals = con.execute("""
+        SELECT 
+        SUM(CASE WHEN reactions.reaction = 'like' THEN 1 ELSE 0 END) as total_likes,
+        SUM(CASE WHEN reactions.reaction = 'dislike' THEN 1 ELSE 0 END) as total_dislikes
+        FROM posts
+        LEFT JOIN reactions ON posts.id = reactions.post_id
+        WHERE posts.user_id = ?
+    """, (user_id,)).fetchone()
+
+    total_likes = totals["total_likes"] or 0
+    total_dislikes = totals["total_dislikes"] or 0
+
+    followers_count = con.execute("SELECT COUNT(*) as cnt FROM follows WHERE following_id = ?", (user_id,)).fetchone()["cnt"]
+    following_count = con.execute("SELECT COUNT(*) as cnt FROM follows WHERE follower_id = ?", (user_id,)).fetchone()["cnt"]
+
+    follower_list = con.execute("""
+        SELECT users.username FROM follows
+        JOIN users ON follows.follower_id = users.id
+        WHERE follows.following_id = ?
+    """, (user_id,)).fetchall()
+
+    con.close()
+
+    posts_html = ""
+    for p in posts:
+        if p["media_type"] == "image":
+            media = f'<img src="/uploads/{p["filename"]}" alt="Media">'
+        else:
+            media = f'<video controls><source src="/uploads/{p["filename"]}">Your browser does not support video.</video>'
+
+        posts_html += f"""
+        <div class="card" style="margin-top: 15px;">
+            <div class="post-title">{p['title'] if p['title'] else 'Untitled'}</div>
+            {media}
+            <div class="reactions" style="margin-top: 10px;">
+                <span class="count">👍 {p['likes']}</span>
+                <span class="count">👎 {p['dislikes']}</span>
+            </div>
+        </div>
+        """
+
+    if not posts_html:
+        posts_html = '<p class="small">Apni ekhono kono post upload করেননি।</p>'
+
+    followers_names = ", ".join([f["username"] for f in follower_list]) if follower_list else "Keu nei"
+
+    return page(f"""
+        <div class="card">
+            <h2>👤 Amar Profile ({current_user['username']})</h2>
+            <p><strong>bKash Number:</strong> {current_user['bkash_number'] if current_user['bkash_number'] else 'Set kora nei (Monetization page theke set korun)'}</p>
+            <p><strong>Followers:</strong> {followers_count} | <strong>Following:</strong> {following_count}</p>
+            <p><strong>Total Likes Received:</strong> 👍 {total_likes} | <strong>Total Dislikes Received:</strong> 👎 {total_dislikes}</p>
+            <p><strong>Followers List:</strong> {followers_names}</p>
+        </div>
+        <h2>🖼️ Amar Upload kora Post-gulo</h2>
+        {posts_html}
+    """)
+
+
+# =========================================================
+# UPLOAD
+# =========================================================
+
+@app.route("/upload", methods=["GET", "POST"])
+def upload():
+    if "user" not in session or session["user"] == "admin":
+        return redirect("/login")
+
+    message = ""
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        file = request.files.get("file")
+
+        if not title:
+            message = "Please enter a title for your post."
+        elif len(title) > 100:
+            message = "Title must be under 100 characters."
+        elif not file or not file.filename:
+            message = "Please select a file."
+        else:
+            original = secure_filename(file.filename)
+            if "." not in original:
+                message = "Invalid file."
+            else:
+                ext = original.rsplit(".", 1)[1].lower()
+                if ext not in ALLOWED:
+                    message = "Allowed: JPG, PNG, GIF, WEBP, MP4 and WEBM."
+                else:
+                    filename = uuid.uuid4().hex + "." + ext
+                    file.save(os.path.join(UPLOAD_DIR, filename))
+
+                    media_type = "image" if ext in {"jpg", "jpeg", "png", "gif", "webp"} else "video"
+
+                    con = get_db()
+                    user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+                    if not user:
+                        con.close()
+                        return redirect("/logout")
+
+                    con.execute("""
+                        INSERT INTO posts(user_id, title, filename, original_name, media_type)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (user["id"], title, filename, original, media_type))
+                    con.commit()
+                    con.close()
+                    return redirect("/")
+
+    return page(f"""
+        <div class="card">
+            <h2>📤 Upload Photo or Video</h2>
+            <p class="error">{message}</p>
+            <form method="POST" enctype="multipart/form-data">
+                <input type="text" name="title" placeholder="Enter Post Title (required)" maxlength="100" required>
+                <input type="file" name="file" accept="image/*,video/*" required>
+                <button class="primary">Upload</button>
+            </form>
+            <p class="small">JPG, PNG, GIF, WEBP, MP4, WEBM</p>
+        </div>
+    """)
+
+
+# =========================================================
+# LIKE / DISLIKE
+# =========================================================
+
+@app.route("/react/<int:post_id>", methods=["POST"])
+def react(post_id):
+    if "user" not in session:
+        return redirect("/login")
+
+    reaction = request.form.get("reaction", "")
+    if reaction not in {"like", "dislike"}:
+        return redirect("/")
+
+    con = get_db()
+    user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+    post = con.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone()
+
+    if not user or not post:
+        con.close()
+        return redirect("/")
+
+    user_id = user["id"]
+    existing = con.execute("""
+        SELECT * FROM reactions WHERE user_id = ? AND post_id = ?
+    """, (user_id, post_id)).fetchone()
+
+    if existing:
+        if existing["reaction"] == reaction:
+            con.execute("DELETE FROM reactions WHERE user_id = ? AND post_id = ?", (user_id, post_id))
+        else:
+            con.execute("UPDATE reactions SET reaction = ? WHERE user_id = ? AND post_id = ?", (reaction, user_id, post_id))
+    else:
+        con.execute("INSERT INTO reactions(user_id, post_id, reaction) VALUES (?, ?, ?)", (user_id, post_id, reaction))
+
+    con.commit()
+    con.close()
+    return redirect("/")
+
+
+# =========================================================
+# REPORT POST
+# =========================================================
+
+@app.route("/report/<int:post_id>", methods=["POST"])
+def report_post(post_id):
+    if "user" not in session:
+        return redirect("/login")
+
+    con = get_db()
+    current_user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+    post = con.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
+
+    if not current_user or not post:
+        con.close()
+        return redirect("/")
+
+    try:
+        con.execute("INSERT INTO reports(user_id, post_id) VALUES (?, ?)", (current_user["id"], post_id))
+        con.commit()
+    except sqlite3.IntegrityError:
+        pass
+
+    report_count = con.execute("SELECT COUNT(*) as cnt FROM reports WHERE post_id = ?", (post_id,)).fetchone()["cnt"]
+
+    if report_count > 3:
+        owner_id = post["user_id"]
+        con.execute("UPDATE users SET is_suspended = 1 WHERE id = ?", (owner_id,))
+
+        user_posts = con.execute("SELECT * FROM posts WHERE user_id = ?", (owner_id,)).fetchall()
+        for p in user_posts:
+            file_path = os.path.join(UPLOAD_DIR, p["filename"])
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            con.execute("DELETE FROM comments WHERE post_id = ?", (p["id"],))
+            con.execute("DELETE FROM reactions WHERE post_id = ?", (p["id"],))
+            con.execute("DELETE FROM reports WHERE post_id = ?", (p["id"],))
+
+        con.execute("DELETE FROM posts WHERE user_id = ?", (owner_id,))
+        con.commit()
+
+        owner_username = con.execute("SELECT username FROM users WHERE id = ?", (owner_id,)).fetchone()
+        if owner_username and session.get("user") == owner_username["username"]:
+            session.clear()
+
+    con.close()
+    return redirect("/")
+
+
+# =========================================================
+# COMMENT & REPLY
+# =========================================================
+
+@app.route("/comment/<int:post_id>", methods=["POST"])
+def comment(post_id):
+    if "user" not in session:
+        return redirect("/login")
+
+    comment_text = request.form.get("comment", "").strip()
+    parent_id = request.form.get("parent_id")
+    if not comment_text:
+        return redirect("/")
+
+    comment_text = comment_text[:1000]
+    con = get_db()
+    user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+    post = con.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone()
+
+    if user and post:
+        con.execute("""
+            INSERT INTO comments(user_id, post_id, comment, parent_id)
+            VALUES (?, ?, ?, ?)
+        """, (user["id"], post_id, comment_text, parent_id if parent_id else None))
+        con.commit()
+
+    con.close()
+    return redirect("/")
+
+
+# =========================================================
+# USER SEARCH & FOLLOW / UNFOLLOW
+# =========================================================
+
+@app.route("/search", methods=["GET"])
+def search_users():
+    if "user" not in session:
+        return redirect("/login")
+
+    query = request.args.get("q", "").strip()
+    results = []
+
+    con = get_db()
+    current_user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+
+    if query:
+        results = con.execute("""
+            SELECT id, username
+            FROM users
+            WHERE username LIKE ?
+              AND username != ?
+              AND username != 'admin'
+              AND is_suspended = 0
+            ORDER BY username ASC
+            LIMIT 50
+        """, ('%' + query + '%', session["user"])).fetchall()
+
+    following_ids = set()
+    if current_user:
+        f_rows = con.execute("SELECT following_id FROM follows WHERE follower_id = ?", (current_user["id"],)).fetchall()
+        for r in f_rows:
+            following_ids.add(r["following_id"])
+
+    con.close()
+
+    result_html = ""
+    for user in results:
+        is_following = user["id"] in following_ids
+        btn_text = "Unfollow" if is_following else "Follow"
+        btn_class = "dislike-button" if is_following else "primary"
+
+        result_html += f"""
+        <div class="user-result">
+            <div>
+                <strong>👤 {user['username']}</strong>
+            </div>
+            <div style="display: flex; gap: 8px;">
+                <form method="POST" action="/follow/{user['id']}" style="margin:0;">
+                    <button class="{btn_class}">{btn_text}</button>
+                </form>
+                <a href="/message/{user['id']}">
+                    <button class="neutral-button">💬 Message</button>
+                </a>
+            </div>
+        </div>
+        """
+
+    if query and not results:
+        result_html = '<p class="small">No users found.</p>'
+
+    return page(f"""
+        <div class="card">
+            <h2>🔎 Search Users & Follow</h2>
+            <form method="GET" action="/search">
+                <div class="search-box">
+                    <input name="q" value="{query}" placeholder="Search username..." required>
+                    <button class="primary">Search</button>
+                </div>
+            </form>
+        </div>
+        <div class="card">
+            <h2>👥 Search Results</h2>
+            {result_html}
+        </div>
+    """)
+
+
+@app.route("/follow/<int:user_id>", methods=["POST"])
+def follow_user(user_id):
+    if "user" not in session:
+        return redirect("/login")
+
+    con = get_db()
+    current_user = con.execute("SELECT id FROM users WHERE username = ?", (session["user"],)).fetchone()
+
+    if not current_user or current_user["id"] == user_id:
+        con.close()
+        return redirect(request.referrer or "/")
+
+    existing = con.execute("""
+        SELECT * FROM follows WHERE follower_id = ? AND following_id = ?
+    """, (current_user["id"], user_id)).fetchone()
+
+    if existing:
+        con.execute("DELETE FROM follows WHERE follower_id = ? AND following_id = ?", (current_user["id"], user_id))
+    else:
+        con.execute("INSERT INTO follows(follower_id, following_id) VALUES (?, ?)", (current_user["id"], user_id))
+
+    con.commit()
+    con.close()
+    return redirect(request.referrer or "/")
+
+
+# =========================================================
+# PRIVATE CHAT
+# =========================================================
+
+@app.route("/message/<int:user_id>", methods=["GET", "POST"])
+def message_user(user_id):
+    if "user" not in session:
+        return redirect("/login")
+
+    con = get_db()
+    current_user = con.execute("SELECT id, username FROM users WHERE username = ?", (session["user"],)).fetchone()
+    other_user = con.execute("SELECT id, username FROM users WHERE id = ? AND is_suspended = 0", (user_id,)).fetchone()
+
+    if not current_user or not other_user or current_user["id"] == other_user["id"]:
+        con.close()
+        return redirect("/search")
+
+    if request.method == "POST":
+        text = request.form.get("message", "").strip()
+        if text:
+            text = text[:5000]
+            con.execute("""
+                INSERT INTO messages(sender_id, receiver_id, message)
+                VALUES (?, ?, ?)
+            """, (current_user["id"], other_user["id"], text))
+            con.commit()
+        con.close()
+        return redirect(f"/message/{user_id}")
+
+    messages = con.execute("""
+        SELECT messages.*, sender.username AS sender_name
+        FROM messages
+        JOIN users AS sender ON messages.sender_id = sender.id
+        WHERE (messages.sender_id = ? AND messages.receiver_id = ?)
+           OR (messages.sender_id = ? AND messages.receiver_id = ?)
+        ORDER BY messages.id ASC
+    """, (current_user["id"], other_user["id"], other_user["id"], current_user["id"])).fetchall()
+
+    con.close()
+
+    chat_html = ""
+    for msg in messages:
+        message_class = "mine" if msg["sender_id"] == current_user["id"] else ""
+        chat_html += f"""
+        <div class="message {message_class}">
+            <div>
+                <div class="message-bubble">{msg['message']}</div>
+                <div class="message-time">{msg['created_at']}</div>
+            </div>
+        </div>
+        """
+
+    if not chat_html:
+        chat_html = '<p class="small">No messages yet. Say hello! 👋</p>'
+
+    return page(f"""
+        <div class="card">
+            <h2>💬 Chat with {other_user['username']}</h2>
+            <div class="chat-box">{chat_html}</div>
+            <form method="POST" class="chat-form">
+                <textarea name="message" placeholder="Write a message..." maxlength="5000" required></textarea>
+                <button class="primary">➤ Send</button>
+            </form>
+        </div>
+    """)
+
+
+# =========================================================
+# DOWNLOAD
+# =========================================================
+
+@app.route("/download/<int:post_id>")
+def download_file(post_id):
+    con = get_db()
+    post = con.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
+    con.close()
+
+    if not post:
+        return redirect("/")
+
+    return send_from_directory(UPLOAD_DIR, post["filename"], as_attachment=True, download_name=post["original_name"])
+
+
+# =========================================================
+# LOGOUT
+# =========================================================
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
+@app.route("/uploads/<filename>")
+def uploads(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+# =========================================================
+# INIT & RUN
+# =========================================================
+
+init_db()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
